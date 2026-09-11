@@ -128,4 +128,5 @@ jobs:
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/${{ vars.AR_REPO }}/payments-api:${{ github.sha }}"
           sed -e "s|IMAGE_PLACEHOLDER|$IMAGE|" -e "s|VERSION_PLACEHOLDER|${{ github.sha }}|" k8s/deployment.yaml \
             | kubectl apply -f -
+          kubectl apply -f k8s/monitoring.yaml
           kubectl -n payments-api rollout status deployment/payments-api --timeout=300s
