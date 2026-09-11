@@ -1,6 +1,7 @@
 # Scraping and alerting for payments-api, applied by the deploy job with the manifests.
 # The rules carry the labels the platform's incident queue routes on (service, team, owner,
-# environment, severity) and a runbook annotation, so an incident opens already attributed.
+# environment, severity), the action label that routes it (page → approval queue, ticket → ticket
+# queue; without one it is recorded as unrouted) and a runbook annotation.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -32,6 +33,7 @@ spec:
           expr: absent(up{job="payments-api"} == 1)
           for: 1m
           labels:
+            action: page
             severity: critical
             service: payments-api
             team: payments
@@ -51,6 +53,7 @@ spec:
             and sum(rate(payments_rejected_total[2m])) > 0.2
           for: 1m
           labels:
+            action: page
             severity: warning
             service: payments-api
             team: payments
@@ -67,6 +70,7 @@ spec:
               < kube_deployment_spec_replicas{namespace="payments-api", deployment="payments-api"}
           for: 2m
           labels:
+            action: ticket
             severity: warning
             service: payments-api
             team: payments
