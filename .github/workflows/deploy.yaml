@@ -1,0 +1,131 @@
+# payments-api delivery: commit → test → scan → publish artifact → build image → push → deploy.
+#
+# The same shape as the oopsapi pipeline, which runs today: authenticates with the `oopsapi-ci`
+# service-account key in secrets.GCP_SA_KEY (build, push, deploy; no IAM-admin role), and deploys
+# from a runner inside the GKE cluster, because the control plane admits no GitHub-hosted address.
+#
+# Set before the first run: vars.GCP_PROJECT, vars.GCP_REGION, vars.AR_REPO, vars.GKE_CLUSTER,
+# secrets.GCP_SA_KEY. Orbitward's "Payments API delivery" template mirrors this pipeline and can
+# deliver updated manifests here.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest && python -m pytest -q
+
+  scan:
+    name: Security scan
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+        continue-on-error: true
+      - name: Gate on fixable critical findings
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  publish-artifact:
+    name: Publish artifact
+    runs-on: ubuntu-latest
+    needs: scan
+    steps:
+      - uses: actions/checkout@v4
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Package and upload to Artifact Registry (generic)
+        run: |
+          tar --exclude-vcs -czf payments-api-${{ github.sha }}.tar.gz app.py Dockerfile k8s
+          gcloud artifacts generic upload \
+            --project="${{ vars.GCP_PROJECT }}" \
+            --location="${{ vars.GCP_REGION }}" \
+            --repository="${{ vars.AR_REPO }}-generic" \
+            --package=payments-api --version="${{ github.sha }}" \
+            --source=payments-api-${{ github.sha }}.tar.gz
+
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    needs: publish-artifact
+    steps:
+      - uses: actions/checkout@v4
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+      - name: Build and push image
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/${{ vars.AR_REPO }}/payments-api"
+          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+      - name: Scan the built image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/${{ vars.AR_REPO }}/payments-api:${{ github.sha }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  deploy:
+    name: Deploy to GKE
+    # A self-hosted runner inside the cluster: it reaches kubernetes.default.svc and never touches
+    # the control plane's public endpoint, which admits no GitHub-hosted address.
+    runs-on: payments-api-runners
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.31.0
+      - name: Deploy
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/${{ vars.AR_REPO }}/payments-api:${{ github.sha }}"
+          sed -e "s|IMAGE_PLACEHOLDER|$IMAGE|" -e "s|VERSION_PLACEHOLDER|${{ github.sha }}|" k8s/deployment.yaml \
+            | kubectl apply -f -
+          kubectl -n payments-api rollout status deployment/payments-api --timeout=300s
