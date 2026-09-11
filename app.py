@@ -17,7 +17,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERSION = os.environ.get("APP_VERSION", "dev")
-CURRENCIES = {"USD", "EUR", "GBP", "INR"}
+CURRENCIES = {"USD", "EUR", "GBP", "INR", "AUD"}
 _LOCK = threading.Lock()
 _PAYMENTS: dict[str, dict] = {}
 _BY_KEY: dict[str, str] = {}
@@ -85,7 +85,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/healthz":
-            return self._json(200, {"status": "ok", "version": VERSION})
+            return self._json(200, {"status": "ok", "version": VERSION, "currencies": sorted(CURRENCIES)})
         if self.path == "/readyz":
             return self._json(200, {"ready": True})
         if self.path == "/metrics":
