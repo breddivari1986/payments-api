@@ -1,0 +1,121 @@
+# Install once in .github/workflows/ci.yml on a protected, reviewed delivery ref.
+# Application Dockerfile must provide a `test` stage whose CMD executes its test suite.
+name: Orbitward CI
+run-name: orbitward:${{ inputs.request_key }}
+on:
+  workflow_dispatch:
+    inputs:
+      request_key: { required: true, type: string }
+      source_sha: { required: true, type: string }
+      release: { required: true, type: string }
+permissions:
+  contents: read
+concurrency:
+  group: orbitward-ci-${{ inputs.request_key }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      evidence_name: ${{ steps.identity.outputs.name }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Validate immutable input
+        id: identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUEST_KEY: ${{ inputs.request_key }}
+          TRIVY_IMAGE: ${{ vars.ORBITWARD_TRIVY_IMAGE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$REQUEST_KEY" =~ ^delivery-[a-f0-9]{32}:ci$ ]]
+          [[ "$TRIVY_IMAGE" =~ ^aquasec/trivy@sha256:[a-f0-9]{64}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "name=orbitward-build-${REQUEST_KEY//:/-}" >> "$GITHUB_OUTPUT"
+      - name: Build and execute tests in a container
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          docker build --target test -t orbitward-tests .
+          docker run --rm --network none --memory 2g --cpus 2 --pids-limit 256 orbitward-tests
+          docker build --build-arg APP_VERSION="$SOURCE_SHA" -t orbitward-release .
+          docker save orbitward-release -o /tmp/release.tar
+      - name: Scan source, configuration and the built image
+        env:
+          TRIVY_IMAGE: ${{ vars.ORBITWARD_TRIVY_IMAGE }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/scan:ro" "$TRIVY_IMAGE" fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 /scan
+          docker run --rm -v /tmp/release.tar:/release.tar:ro "$TRIVY_IMAGE" image --input /release.tar --severity HIGH,CRITICAL --exit-code 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ steps.identity.outputs.name }}
+          path: /tmp/release.tar
+          if-no-files-found: error
+          retention-days: 1
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      id-token: write
+    steps:
+      - name: Authenticate the publisher with short-lived Google credentials
+        id: google
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: projects/277211249216/locations/global/workloadIdentityPools/orbitward-payments/providers/github
+          service_account: orbitward-payments-publisher@bp-labs-host-507507.iam.gserviceaccount.com
+          token_format: access_token
+          access_token_lifetime: 600s
+          create_credentials_file: false
+      - name: Download this run's tested archive, publish by immutable digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUEST_KEY: ${{ inputs.request_key }}
+          BUILD_NAME: ${{ needs.build.outputs.evidence_name }}
+          GAR_TOKEN: ${{ steps.google.outputs.access_token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tested /tmp/evidence
+          gh run download "$RUN_ID" --repo "$REPOSITORY" --name "$BUILD_NAME" --dir /tmp/tested
+          image="us-central1-docker.pkg.dev/bp-labs-host-507507/orbitward-payments/payments-api"
+          echo "$GAR_TOKEN" | docker login us-central1-docker.pkg.dev -u oauth2accesstoken --password-stdin
+          trap 'docker logout us-central1-docker.pkg.dev' EXIT
+          docker load -i /tmp/tested/release.tar
+          tag="${REQUEST_KEY//:/-}-$RUN_ID"
+          tested_id="$(docker inspect --format '{{.Id}}' orbitward-release)"
+          docker tag orbitward-release "$image:$tag"
+          docker push "$image:$tag"
+          docker pull "$image:$tag"
+          test "$(docker inspect --format '{{.Id}}' "$image:$tag")" = "$tested_id"
+          export IMAGE_LOCATION="$image"
+          export IMAGE_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$tag" | cut -d@ -f2)"
+          python3 - <<'PY'
+          import json, os, re
+          d = os.environ['IMAGE_DIGEST']
+          assert re.fullmatch(r'sha256:[a-f0-9]{64}', d)
+          value = {'source': {'repository': 'https://github.com/' + os.environ['REPOSITORY'], 'commit': os.environ['SOURCE_SHA']},
+                   'location': os.environ['IMAGE_LOCATION'], 'digest': d, 'validated': True,
+                   'tests': 'passed', 'security': 'passed', 'publication': 'passed'}
+          open('/tmp/evidence/release.json','w').write(json.dumps(value))
+          PY
+          echo "EVIDENCE_NAME=orbitward-evidence-${REQUEST_KEY//:/-}" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ env.EVIDENCE_NAME }}
+          path: /tmp/evidence/release.json
+          if-no-files-found: error
+          retention-days: 7

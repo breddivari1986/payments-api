@@ -1,0 +1,14 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: payments-api
+  description: Payments API development service
+  annotations:
+    github.com/project-slug: breddivari1986/payments-api
+  links:
+    - title: Source
+      url: https://github.com/breddivari1986/payments-api
+spec:
+  type: service
+  lifecycle: experimental
+  owner: payments

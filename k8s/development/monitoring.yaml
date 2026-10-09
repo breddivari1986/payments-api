@@ -1,0 +1,83 @@
+# Scraping and alerting for payments-api, applied by the deploy job with the manifests.
+# The rules carry the labels the platform's incident queue routes on (service, team, owner,
+# environment, severity), the action label that routes it (page → approval queue, ticket → ticket
+# queue; without one it is recorded as unrouted) and a runbook annotation.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: payments-api
+  namespace: payment
+  labels:
+    app: payments-api
+spec:
+  selector:
+    matchLabels:
+      app: payments-api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: payments-api
+  namespace: payment
+  labels:
+    app: payments-api
+spec:
+  groups:
+    - name: payments-api
+      rules:
+        - alert: PaymentsApiDown
+          expr: absent(up{namespace="payment",service="payments-api"} == 1)
+          for: 1m
+          labels:
+            action: page
+            severity: critical
+            service: payments
+            team: payments
+            business_unit: fintech
+            owner: payments
+            environment: development
+          annotations:
+            summary: "payments-api has no healthy scrape target"
+            description: "Prometheus sees no up payments-api pod in namespace payment for over a minute."
+            runbook_url: "https://github.com/breddivari1986/payments-api/blob/main/README.md#runbook-down"
+        - alert: PaymentsApiHighRejectionRate
+          expr: |
+            sum(rate(payments_rejected_total{namespace="payment",service="payments-api"}[2m]))
+              /
+            clamp_min(sum(rate(payments_created_total{namespace="payment",service="payments-api"}[2m])) + sum(rate(payments_rejected_total{namespace="payment",service="payments-api"}[2m])), 0.001)
+              > 0.5
+            and sum(rate(payments_rejected_total{namespace="payment",service="payments-api"}[2m])) > 0.2
+          for: 1m
+          labels:
+            action: page
+            severity: warning
+            service: payments
+            team: payments
+            business_unit: fintech
+            owner: payments
+            environment: development
+          annotations:
+            summary: "More than half of payment requests are being rejected"
+            description: "Validation rejections exceed 50% of requests over 2 minutes, at more than 0.2 rejections per second."
+            runbook_url: "https://github.com/breddivari1986/payments-api/blob/main/README.md#runbook-rejections"
+        - alert: PaymentsApiReplicasUnavailable
+          expr: |
+            kube_deployment_status_replicas_available{namespace="payment", deployment="payments-api"}
+              < kube_deployment_spec_replicas{namespace="payment", deployment="payments-api"}
+          for: 2m
+          labels:
+            action: ticket
+            severity: warning
+            service: payments
+            team: payments
+            business_unit: fintech
+            owner: payments
+            environment: development
+          annotations:
+            summary: "payments-api has fewer available replicas than requested"
+            description: "The deployment has been below its requested replica count for two minutes."
+            runbook_url: "https://github.com/breddivari1986/payments-api/blob/main/README.md#runbook-replicas"
