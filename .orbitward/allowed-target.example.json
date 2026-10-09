@@ -1,0 +1,7 @@
+{
+  "context": "gke_bp-labs-host-507507_us-central1_gke-private-prod",
+  "namespace": "payment",
+  "deployment": "payments-api",
+  "container": "payments-api",
+  "namespacePolicy": "create-if-missing"
+}

@@ -1,0 +1,45 @@
+# Install as cd.yml; use a separate copy named rollback.yml for the recovery binding.
+# The runner's kubeconfig and ALLOWED_* variables are provisioned by the platform operator.
+name: Orbitward CD
+run-name: orbitward:${{ inputs.request_key }}
+on:
+  workflow_dispatch:
+    inputs:
+      request_key: { required: true, type: string }
+      source_sha: { required: true, type: string }
+      release: { required: true, type: string }
+permissions:
+  contents: read
+concurrency:
+  group: orbitward-delivery-${{ vars.ORBITWARD_TARGET_ID }}
+  cancel-in-progress: false
+jobs:
+  deploy:
+    # Dedicated Payments CD scale set. Never target this runner from untrusted PR jobs.
+    runs-on: orbitward-payments-cd
+    environment: development
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: control
+      - name: Ensure approved namespace, deploy and verify
+        env:
+          ORBITWARD_RELEASE: ${{ inputs.release }}
+          ORBITWARD_REQUEST_KEY: ${{ inputs.request_key }}
+          ORBITWARD_ALLOWED_TARGET: ${{ vars.ORBITWARD_ALLOWED_TARGET }}
+          ORBITWARD_ALLOWED_IMAGE: ${{ vars.ORBITWARD_ALLOWED_IMAGE }}
+          ORBITWARD_HEALTH_URL: ${{ vars.ORBITWARD_HEALTH_URL }}
+          # A short-lived credential file provided only to this private runner.
+          KUBECONFIG: ${{ vars.ORBITWARD_KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          python3 control/.orbitward/deploy_release.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ env.ORBITWARD_EVIDENCE_NAME }}
+          path: verification.json
+          if-no-files-found: error
+          retention-days: 7
